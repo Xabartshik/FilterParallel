@@ -1,0 +1,342 @@
+﻿using Microsoft.Win32;
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.IO;
+using System.Drawing;
+using System.Drawing.Imaging;
+
+namespace FilterParallel
+{
+    public partial class MainWindow : Window
+    {
+        private BitmapSource originalImage;
+        private BitmapSource filteredImage;
+        private List<double[,]> presetFilters = new List<double[,]>();
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            InitializePresetFilters();
+            this.Loaded += MainWindow_Loaded; // Добавляем обработчик загрузки окна
+        }
+
+        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            // Инициализируем видимость панелей после загрузки окна
+            FilterTypeRadioButton_Checked(null, null);
+        }
+
+        private void InitializePresetFilters()
+        {
+            // Гауссовский фильтр 3x3
+            presetFilters.Add(new double[,]
+            {
+                {1, 2, 1},
+                {2, 4, 2},
+                {1, 2, 1}
+            });
+
+            // Фильтр резкости 3x3
+            presetFilters.Add(new double[,]
+            {
+                {0, -1, 0},
+                {-1, 5, -1},
+                {0, -1, 0}
+            });
+
+            // Фильтр "Размытие" 5x5
+            presetFilters.Add(new double[,]
+            {
+                {1, 1, 1, 1, 1},
+                {1, 1, 1, 1, 1},
+                {1, 1, 1, 1, 1},
+                {1, 1, 1, 1, 1},
+                {1, 1, 1, 1, 1}
+            });
+
+            PresetFilterComboBox.Items.Add("Гауссовский фильтр 3x3");
+            PresetFilterComboBox.Items.Add("Фильтр резкости 3x3");
+            PresetFilterComboBox.Items.Add("Размытие 5x5");
+            PresetFilterComboBox.SelectedIndex = 0;
+        }
+
+        private void LoadImageButton_Click(object sender, RoutedEventArgs e)
+        {
+            OpenFileDialog openFileDialog = new OpenFileDialog
+            {
+                Filter = "Image files (*.jpg, *.jpeg, *.png)|*.jpg;*.jpeg;*.png"
+            };
+
+            if (openFileDialog.ShowDialog() == true)
+            {
+                try
+                {
+                    originalImage = new BitmapImage(new Uri(openFileDialog.FileName));
+                    filteredImage = originalImage;
+                    OriginalImage.Source = originalImage;
+                    FilteredImage.Source = filteredImage;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Ошибка загрузки изображения: {ex.Message}");
+                }
+            }
+        }
+
+        private void UpdateFilteredImage(Bitmap partialResult, int processedRows)
+        {
+            // Обновляем UI в основном потоке
+            Dispatcher.Invoke(() =>
+            {
+                // Конвертируем частичный результат в BitmapSource
+                var partialBitmapSource = BitmapToBitmapSource(partialResult);
+
+                // Создаем новое изображение, комбинируя обработанные и белые части
+                DrawingVisual visual = new DrawingVisual();
+                using (DrawingContext context = visual.RenderOpen())
+                {
+                    // Рисуем белый фон
+                    context.DrawRectangle(System.Windows.Media.Brushes.White, null,
+                        new Rect(0, 0, partialResult.Width, partialResult.Height));
+
+                    // Рисуем обработанную часть
+                    if (processedRows > 0)
+                    {
+                        CroppedBitmap cropped = new CroppedBitmap(partialBitmapSource,
+                            new Int32Rect(0, 0, partialResult.Width, processedRows));
+                        context.DrawImage(cropped, new Rect(0, 0, partialResult.Width, processedRows));
+                    }
+                }
+
+                // Рендерим визуал в BitmapSource
+                RenderTargetBitmap rtb = new RenderTargetBitmap(
+                    partialResult.Width, partialResult.Height, 96, 96, PixelFormats.Pbgra32);
+                rtb.Render(visual);
+
+                // Обновляем изображение
+                FilteredImage.Source = rtb;
+            });
+        }
+
+        private async void ApplyFilterButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (originalImage == null)
+            {
+                MessageBox.Show("Пожалуйста, загрузите изображение сначала.");
+                return;
+            }
+
+            ApplyFilterButton.IsEnabled = false;
+            LoadingProgress.Visibility = Visibility.Visible;
+
+            try
+            {
+                double[,] filter;
+                double factor;
+
+                if (ManualRadioButton.IsChecked == true)
+                {
+                    try
+                    {
+                        int size = int.Parse(MatrixSizeTextBox.Text) + 1;
+                        factor = double.Parse(FactorTextBox.Text);
+
+                        filter = new double[size, size];
+                        string[] rows = FilterMatrixTextBox.Text.Split('\n');
+
+                        for (int i = 0; i < size; i++)
+                        {
+                            string[] values = rows[i].Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            for (int j = 0; j < size; j++)
+                            {
+                                filter[i, j] = double.Parse(values[j]);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"Ошибка ввода данных фильтра: {ex.Message}");
+                        return;
+                    }
+                }
+                else
+                {
+                    int selectedIndex = PresetFilterComboBox.SelectedIndex;
+                    filter = presetFilters[selectedIndex];
+                    factor = 1.0 / GetFilterSum(filter);
+                }
+
+                // Конвертируем в Bitmap
+                Bitmap bitmap = BitmapSourceToBitmap(originalImage);
+
+                // Применяем фильтр с отображением прогресса
+                filteredImage = BitmapToBitmapSource(await Task.Run(() =>
+                    ApplyFilterParallel(bitmap, filter, factor, UpdateFilteredImage)));
+
+                // Отображаем окончательный результат
+                FilteredImage.Source = filteredImage;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка: {ex.Message}");
+            }
+            finally
+            {
+                ApplyFilterButton.IsEnabled = true;
+                LoadingProgress.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        
+        private Bitmap ApplyFilterParallel(Bitmap sourceBitmap, double[,] filter, double factor,
+    Action<Bitmap, int> progressCallback = null)
+        {
+            Bitmap resultBitmap = new Bitmap(sourceBitmap.Width, sourceBitmap.Height);
+
+            // Заполняем изображение белым цветом
+            using (Graphics g = Graphics.FromImage(resultBitmap))
+            {
+                g.Clear(System.Drawing.Color.White);
+            }
+
+            int filterSize = filter.GetLength(0);
+            int filterOffset = filterSize / 2;
+            int processedRows = 0;
+
+            Parallel.For(0, sourceBitmap.Height, y =>
+            {
+                for (int x = 0; x < sourceBitmap.Width; x++)
+                {
+                    double red = 0.0, green = 0.0, blue = 0.0;
+
+                    for (int fy = 0; fy < filterSize; fy++)
+                    {
+                        for (int fx = 0; fx < filterSize; fx++)
+                        {
+                            int imageX = x + fx - filterOffset;
+                            int imageY = y + fy - filterOffset;
+
+                            imageX = Math.Clamp(imageX, 0, sourceBitmap.Width - 1);
+                            imageY = Math.Clamp(imageY, 0, sourceBitmap.Height - 1);
+
+                            System.Drawing.Color pixel = sourceBitmap.GetPixel(imageX, imageY);
+                            red += pixel.R * filter[fy, fx];
+                            green += pixel.G * filter[fy, fx];
+                            blue += pixel.B * filter[fy, fx];
+                        }
+                    }
+
+                    red = Math.Clamp(red * factor, 0, 255);
+                    green = Math.Clamp(green * factor, 0, 255);
+                    blue = Math.Clamp(blue * factor, 0, 255);
+
+                    lock (resultBitmap)
+                    {
+                        resultBitmap.SetPixel(x, y, System.Drawing.Color.FromArgb(
+                            (byte)red, (byte)green, (byte)blue));
+                    }
+                }
+
+                // Обновляем прогресс после обработки каждой строки
+                int currentRows = Interlocked.Increment(ref processedRows);
+                progressCallback?.Invoke(resultBitmap, currentRows);
+            });
+
+            return resultBitmap;
+        }
+
+        private double GetFilterSum(double[,] filter)
+        {
+            double sum = 0;
+            for (int i = 0; i < filter.GetLength(0); i++)
+            {
+                for (int j = 0; j < filter.GetLength(1); j++)
+                {
+                    sum += filter[i, j];
+                }
+            }
+            return sum == 0 ? 1 : sum;
+        }
+
+        private void SaveImageButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (filteredImage == null)
+            {
+                MessageBox.Show("Нет изображения для сохранения.");
+                return;
+            }
+
+            SaveFileDialog saveFileDialog = new SaveFileDialog
+            {
+                Filter = "JPEG Image|*.jpg|PNG Image|*.png"
+            };
+
+            if (saveFileDialog.ShowDialog() == true)
+            {
+                try
+                {
+                    BitmapEncoder encoder = saveFileDialog.FilterIndex == 1 ?
+                        new JpegBitmapEncoder() : (BitmapEncoder)new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(filteredImage));
+
+                    using (FileStream stream = new FileStream(saveFileDialog.FileName, FileMode.Create))
+                    {
+                        encoder.Save(stream);
+                    }
+
+                    MessageBox.Show("Изображение успешно сохранено.");
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Ошибка сохранения изображения: {ex.Message}");
+                }
+            }
+        }
+
+        private void FilterTypeRadioButton_Checked(object sender, RoutedEventArgs e)
+        {
+            if (ManualOptionsPanel != null && PresetOptionsPanel != null &&
+                ManualRadioButton != null && PresetRadioButton != null)
+            {
+                ManualOptionsPanel.Visibility = ManualRadioButton.IsChecked == true ?
+                    Visibility.Visible : Visibility.Collapsed;
+                PresetOptionsPanel.Visibility = PresetRadioButton.IsChecked == true ?
+                    Visibility.Visible : Visibility.Collapsed;
+            }
+        }
+
+        // Вспомогательные методы для конвертации между Bitmap и BitmapSource
+        private Bitmap BitmapSourceToBitmap(BitmapSource bitmapSource)
+        {
+            Bitmap bitmap;
+            using (MemoryStream outStream = new MemoryStream())
+            {
+                BitmapEncoder enc = new BmpBitmapEncoder();
+                enc.Frames.Add(BitmapFrame.Create(bitmapSource));
+                enc.Save(outStream);
+                bitmap = new Bitmap(outStream);
+            }
+            return bitmap;
+        }
+
+        private BitmapSource BitmapToBitmapSource(Bitmap bitmap)
+        {
+            using (MemoryStream memory = new MemoryStream())
+            {
+                bitmap.Save(memory, ImageFormat.Png);
+                memory.Position = 0;
+                BitmapImage bitmapImage = new BitmapImage();
+                bitmapImage.BeginInit();
+                bitmapImage.StreamSource = memory;
+                bitmapImage.CacheOption = BitmapCacheOption.OnLoad;
+                bitmapImage.EndInit();
+                return bitmapImage;
+            }
+        }
+    }
+}
