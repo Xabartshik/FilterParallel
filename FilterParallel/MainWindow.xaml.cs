@@ -143,7 +143,7 @@ namespace FilterParallel
 
                 // Применяем фильтр с отображением прогресса
                 filteredImage = BitmapToBitmapSource(await Task.Run(() =>
-                    ApplyFilterParallel(bitmap, filter, factor)));
+                    ApplyFilterParallelPool(bitmap, filter, factor)));
 
                 // Отображаем окончательный результат
                 FilteredImage.Source = filteredImage;
@@ -158,7 +158,7 @@ namespace FilterParallel
             }
         }
 
-
+        //Параллельное применение фильтра к Bitmap изображения
         private Bitmap ApplyFilterParallel(Bitmap sourceBitmap, double[,] filter, double factor)
         {
             int filterSize = filter.GetLength(0);
@@ -237,6 +237,87 @@ namespace FilterParallel
 
             return sourceBitmap;
         }
+
+        private Bitmap ApplyFilterParallelPool(Bitmap sourceBitmap, double[,] filter, double factor)
+        {
+            int filterSize = filter.GetLength(0);
+            int filterOffset = filterSize / 2;
+            int width = sourceBitmap.Width;
+            int height = sourceBitmap.Height;
+
+            // Блокируем биты исходного изображения
+            BitmapData sourceData = sourceBitmap.LockBits(
+                new Rectangle(0, 0, width, height),
+                ImageLockMode.ReadOnly,
+                PixelFormat.Format32bppArgb);
+
+            // Копируем пиксели в массив
+            byte[] sourcePixels = new byte[width * height * 4];
+            Marshal.Copy(sourceData.Scan0, sourcePixels, 0, sourcePixels.Length);
+            sourceBitmap.UnlockBits(sourceData);
+
+            // Создаем массив для результата
+            byte[] resultPixels = new byte[width * height * 4];
+
+            // Используем счетчик событий для синхронизации
+            using (CountdownEvent countdownEvent = new CountdownEvent(height))
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    int currentY = y; // Локальная копия для замыкания
+                    //Помещаем объект в очередь задач
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        for (int x = 0; x < width; x++)
+                        {
+                            double red = 0.0, green = 0.0, blue = 0.0;
+
+                            for (int fy = 0; fy < filterSize; fy++)
+                            {
+                                for (int fx = 0; fx < filterSize; fx++)
+                                {
+                                    int imageX = x + fx - filterOffset;
+                                    int imageY = currentY + fy - filterOffset;
+                                    imageX = Math.Clamp(imageX, 0, width - 1);
+                                    imageY = Math.Clamp(imageY, 0, height - 1);
+
+                                    int sourceIndex = (imageY * width + imageX) * 4;
+                                    blue += sourcePixels[sourceIndex] * filter[fy, fx];
+                                    green += sourcePixels[sourceIndex + 1] * filter[fy, fx];
+                                    red += sourcePixels[sourceIndex + 2] * filter[fy, fx];
+                                }
+                            }
+
+                            red = Math.Clamp(red * factor, 0, 255);
+                            green = Math.Clamp(green * factor, 0, 255);
+                            blue = Math.Clamp(blue * factor, 0, 255);
+
+                            int resultIndex = (currentY * width + x) * 4;
+                            resultPixels[resultIndex] = (byte)blue;
+                            resultPixels[resultIndex + 1] = (byte)green;
+                            resultPixels[resultIndex + 2] = (byte)red;
+                            resultPixels[resultIndex + 3] = 255; // Альфа-канал
+                        }
+                        //Сообщаем, что поток завершил работу
+                        countdownEvent.Signal();
+                    });
+                }
+
+                // Ожидаем завершения всех задач
+                countdownEvent.Wait();
+            }
+
+            // Копируем результат обратно в Bitmap
+            BitmapData resultData = sourceBitmap.LockBits(
+                new Rectangle(0, 0, width, height),
+                ImageLockMode.WriteOnly,
+                PixelFormat.Format32bppArgb);
+            Marshal.Copy(resultPixels, 0, resultData.Scan0, resultPixels.Length);
+            sourceBitmap.UnlockBits(resultData);
+
+            return sourceBitmap;
+        }
+
 
         private double GetFilterSum(double[,] filter)
         {
